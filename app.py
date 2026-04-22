@@ -36,35 +36,83 @@ def val(cell, v, bg=WHITE, bold=False, size=10, align="left", color="000000", wr
     cell.fill = _fill(bg); cell.alignment = _align(align, wrap); cell.border = _bdr()
 
 # ── Enrichment ─────────────────────────────────────────────────
+M1_COL = "Pickup Arrival Milestone (UTC)"
+M2_COL = "Pickup Departure Milestone (UTC)"
+M3_COL = "Final Destination Arrival Milestone (UTC)"
+M4_COL = "Final Destination Departure Milestone (UTC)"
+
+def _has_milestone(v):
+    """Return True if the cell has a real timestamp value (not empty/nan/0/NaT)."""
+    if v is None: return False
+    s = str(v).strip().lower()
+    return s not in ("", "nan", "none", "0", "nat", "0.0")
+
 def enrich(df_raw):
     df = df_raw.copy()
     df.columns = [c.strip() for c in df.columns]
 
+    # Ensure milestone columns exist (avoid KeyError on edge cases)
+    for col in [M1_COL, M2_COL, M3_COL, M4_COL]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # ── FIX 1: Milestones Completeness ─────────────────────────
+    # Count exactly how many of the 4 milestone columns have a real timestamp value
+    # Result: "0/4", "1/4", "2/4", "3/4", "4/4" only
+    df["Milestones Completeness"] = df.apply(
+        lambda row: "{}/4".format(
+            sum([
+                _has_milestone(row[M1_COL]),
+                _has_milestone(row[M2_COL]),
+                _has_milestone(row[M3_COL]),
+                _has_milestone(row[M4_COL]),
+            ])
+        ), axis=1
+    )
+
+    # ── FIX 2: Milestones Reached ───────────────────────────────
+    # Based on Milestones Completeness, check WHICH of the 4 columns have a value:
+    #   M1 = Pickup Arrival, M2 = Pickup Departure,
+    #   M3 = Final Destination Arrival, M4 = Final Destination Departure
+    # If 0/4 → "None"
+    MILESTONE_MAP = [
+        (M1_COL, "M1"),
+        (M2_COL, "M2"),
+        (M3_COL, "M3"),
+        (M4_COL, "M4"),
+    ]
+    def milestone_reached(row):
+        mc = str(row.get("Milestones Completeness", "0/4")).strip()
+        if mc == "0/4":
+            return "None"
+        reached = [label for col, label in MILESTONE_MAP if _has_milestone(row[col])]
+        return ",".join(reached) if reached else "None"
+
+    df["Milestones Reached"] = df.apply(milestone_reached, axis=1)
+
+    # ── FIX 3: Tracking Status ──────────────────────────────────
+    # Tracked = TRUE  → 4/4 = "Fully Tracked", anything else = "Partially Tracked"
+    # Tracked = FALSE → RCA from "Tracking Error" column (already populated in raw file)
+    df["Tracked_bool"] = df["Tracked"].astype(str).str.upper().str.strip() == "TRUE"
+
     def tracking_status(row):
-        tracked = str(row.get("Tracked","")).strip().upper()
-        fsr     = str(row.get("Final Status Reason","")).strip()
-        if tracked == "TRUE":
-            if "Partial" in fsr: return "Partially Tracked"
-            return "Fully Tracked"
-        te = str(row.get("Tracking Error","")).strip()
-        return te if te and te.lower() not in ("nan","") else (fsr if fsr and fsr.lower() not in ("nan","timed_out","") else "Not Tracked")
+        if row["Tracked_bool"]:
+            # TRUE: determine by milestone completeness
+            mc = str(row.get("Milestones Completeness", "0/4")).strip()
+            return "Fully Tracked" if mc == "4/4" else "Partially Tracked"
+        else:
+            # FALSE: use Tracking Error as the RCA label
+            te = str(row.get("Tracking Error", "")).strip()
+            if te and te.lower() not in ("nan", "none", ""):
+                return te
+            # fallback: Final Status Reason (skip generic TIMED_OUT)
+            fsr = str(row.get("Final Status Reason", "")).strip()
+            if fsr and fsr.lower() not in ("nan", "none", "", "timed_out"):
+                return fsr
+            return "Not Tracked"
 
     df["Tracking Status"] = df.apply(tracking_status, axis=1)
-    df["Tracked_bool"]    = df["Tracked"].astype(str).str.upper().str.strip() == "TRUE"
 
-    def milestone_label(row):
-        m = str(row.get("# Of Milestones received / # Of Milestones expected","")).strip()
-        return m if m and m.lower() != "nan" else "0/4"
-
-    def milestone_reached(row):
-        try:
-            n = int(milestone_label(row).split("/")[0])
-        except Exception:
-            n = 0
-        return ",".join(["M1","M2","M3","M4"][:n])
-
-    df["Milestones Completeness"] = df.apply(milestone_label, axis=1)
-    df["Milestones Reached"]      = df.apply(milestone_reached, axis=1)
     if "Carrier Comments" not in df.columns:
         df["Carrier Comments"] = ""
     return df
@@ -304,13 +352,12 @@ if uploaded:
     st.dataframe(cs, use_container_width=True, hide_index=True)
 
     st.subheader("Generate Enriched File")
-    week_label = st.text_input("Week label for filename (e.g. WK15)", value="WK14")
 
     if st.button("🚀 Generate Enriched Excel", type="primary"):
         with st.spinner("Building enriched report — please wait..."):
             out_bytes, df_e = build_workbook(df_raw)
 
-        fname = f"All_UL_{week_label}.xlsx"
+        fname = "Unilever_DQ_file.xlsx"
         st.download_button(
             label=f"⬇️ Download {fname}",
             data=out_bytes,
